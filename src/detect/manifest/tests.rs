@@ -474,6 +474,112 @@ fn muse_manifest_requires_complete_live_controls() {
 }
 
 #[test]
+fn reasonix_manifest_detects_idle_working_and_blocked_states() {
+    // Composer box (top and bottom rule only) plus the two status rows.
+    let idle = explain(
+        Agent::Reasonix,
+        "◆ reasonix  · deepseek-v4-flash\n  Context is kept across turns. Type 'exit' or Ctrl-D to quit.\n\n  › say hello\n\n──────────────────────────────────────────────────\n\n──────────────────────────────────────────────────\n   Auto  · ready (shift+tab toggles plan · ctrl+y yolo) · effort max\n  deepseek-v4-flash · turn hit 99.94% · avg 99.51% · 354.8K ctx (35%) · 45% to compact",
+    );
+    assert_eq!(idle.state, AgentState::Idle);
+    assert!(idle.visible_idle);
+    assert_eq!(
+        idle.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("idle_composer")
+    );
+
+    // A running turn adds exactly one line above the composer: the bubbletea
+    // `spinner.Dot` glyph, then the localized status label.
+    let working = explain(
+        Agent::Reasonix,
+        "  ● Write(probe.txt)  +1\n   1 + ok\n\n  ⣾  thinking… (3s · Esc cancels) · ↓99\n──────────────────────────────────────────────────\n\n──────────────────────────────────────────────────\n   Auto  · ready (shift+tab toggles plan · ctrl+y yolo) · effort max\n  deepseek-v4-flash · turn hit 98.62% · avg 50.13% · 11.9K ctx (1%) · 79% to compact",
+    );
+    assert_eq!(working.state, AgentState::Working);
+    assert!(working.visible_working);
+    assert_eq!(
+        working.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("working_spinner")
+    );
+
+    // Localized label, other Dot frames, and the cancelling/retry variants all
+    // keep the same spinner line, so the glyph alone carries the working state.
+    for line in [
+        "  ⣽  思考中… (136s · Esc 取消) · ↓1.1K",
+        "  ⡿  思考中… (4s · Esc 取消)",
+        "  ⣷  thinking… (2s · Esc cancels) · ✎ feedback queued",
+        "  ⣻  thinking… (3s · Esc cancels) · ✎ 2 queued",
+    ] {
+        let frame = explain(
+            Agent::Reasonix,
+            &format!(
+                "{line}\n──────────────────────────────────────────────────\n\n──────────────────────────────────────────────────\n   Auto  · ready (shift+tab toggles plan · ctrl+y yolo) · effort max\n  deepseek-v4-flash · turn hit 1.08% · avg 1.08% · 11.8K ctx (1%) · 79% to compact"
+            ),
+        );
+        assert_eq!(frame.state, AgentState::Working, "{line}");
+        assert!(frame.visible_working, "{line}");
+    }
+
+    // Committed tool rows use `spinner.MiniDot` instead, so a finished tool row
+    // left in the transcript is not working evidence.
+    let committed_tool_row = explain(
+        Agent::Reasonix,
+        "  ● Write ⊘ blocked by permission policy\n  ⠋ Write (0s)\n\n──────────────────────────────────────────────────\n\n──────────────────────────────────────────────────\n   Auto  · ready (shift+tab toggles plan · ctrl+y yolo) · effort max\n  deepseek-v4-flash · turn hit 1.08% · avg 1.08% · 11.8K ctx (1%) · 79% to compact",
+    );
+    assert_eq!(committed_tool_row.state, AgentState::Idle);
+    assert!(committed_tool_row.visible_idle);
+
+    let tool_approval = explain(
+        Agent::Reasonix,
+        " ⏸ Permission required\n\nWill call tool write_file probe.txt.\nSource: built-in tool\n1. Allow once\n2. Allow Edit for this session\n3. Always allow Edit (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)\n──────────────────────────────────────────────────\n  ⣾  thinking… (16s · Esc cancels) · ↓99\n   Auto  · 1 approve once · 2 allow scope this session · 3/4 prefix or save when offered · n/Esc deny · Ctrl-C cancels turn · effort max\n  deepseek-v4-flash · turn hit 1.08% · avg 1.08% · 11.8K ctx (1%) · 79% to compact",
+    );
+    assert_eq!(tool_approval.state, AgentState::Blocked);
+    assert!(tool_approval.visible_blocker);
+    assert_eq!(
+        tool_approval
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("approval_blocked")
+    );
+
+    let plan_approval = explain(
+        Agent::Reasonix,
+        " ⏸ 计划已生成（见上方）— Enter/y 批准执行,n/Esc 继续规划\n──────────────────────────────────────────────────\n  ⣾  思考中… (5s · Esc 取消) · ↓512\n   Auto  · Enter/y 批准并执行 · n/Esc 继续规划 · PgUp/PgDn/Ctrl+Home/End 滚动 · effort max\n  deepseek-v4-flash · turn hit 1.08% · avg 1.08% · 11.8K ctx (1%) · 79% to compact",
+    );
+    assert_eq!(plan_approval.state, AgentState::Blocked);
+    assert!(plan_approval.visible_blocker);
+
+    // Question cards are the only screen whose mode row carries `↑/↓` with `←/→`.
+    let question = explain(
+        Agent::Reasonix,
+        " ? Creating probe.txt via write_file was declined. How would you like to proceed?\n ❯ 1. Create it with a shell command instead\n        e.g. echo ok > probe.txt via bash\n   2. Don't create the file — stop here\n        Cancel this task\n   3. Something else\n        Tell me what you'd prefer (different path, different content, etc.)\n   4. Type something else\n ────────────────────────────────────────\n   5. None — just chat\n──────────────────────────────────────────────────\n  ⣾  thinking… (136s · Esc cancels) · ↓1.1K\n   Auto  · ↑/↓ move · number to pick · space multi · Enter confirm · ←/→ switch · Esc cancel · effort max\n  deepseek-v4-flash · turn hit 98.62% · avg 50.13% · 11.9K ctx (1%) · 79% to compact",
+    );
+    assert_eq!(question.state, AgentState::Blocked);
+    assert!(question.visible_blocker);
+    assert_eq!(
+        question.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("question_blocked")
+    );
+
+    // The slash/mention completion popup is a user-opened overlay, and the
+    // resume picker is too: both show `↑/↓` without `←/→` and must stay idle.
+    let completion_popup = explain(
+        Agent::Reasonix,
+        "  › /\n\n──────────────────────────────────────────────────\n\n──────────────────────────────────────────────────\n   Auto  · ↑/↓ move · Tab/Enter select · Esc close · effort max\n  deepseek-v4-flash · turn hit 99.94% · avg 99.51% · 354.8K ctx (35%) · 45% to compact",
+    );
+    assert_eq!(completion_popup.state, AgentState::Idle);
+    assert!(completion_popup.visible_idle);
+
+    // Assistant text that echoes an approval phrase is not a live blocker: the
+    // `⏸` notice glyph has to be on screen for the approval rule to fire.
+    let echoed_approval_text = explain(
+        Agent::Reasonix,
+        "  › what happens if I deny?\n\n  Choose [1/2/3/4] (y/a/p/n also work) once the permission notice appears.\n\n──────────────────────────────────────────────────\n\n──────────────────────────────────────────────────\n   Auto  · ready (shift+tab toggles plan · ctrl+y yolo) · effort max\n  deepseek-v4-flash · turn hit 99.94% · avg 99.51% · 354.8K ctx (35%) · 45% to compact",
+    );
+    assert_eq!(echoed_approval_text.state, AgentState::Idle);
+    assert!(echoed_approval_text.visible_idle);
+}
+
+#[test]
 fn manifest_validation_rejects_unknown_fields_empty_rules_invalid_regions_and_regexes() {
     assert!(parse_manifest(
         r#"

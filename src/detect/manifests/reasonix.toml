@@ -1,0 +1,74 @@
+id = "reasonix"
+version = "2026.09.20.1"
+min_engine_version = 2
+updated_at = "2026-09-20T00:00:00Z"
+aliases = []
+
+# Evidence: live bottom-buffer captures from Reasonix (Go, bubbletea v2 + lipgloss v2)
+# driving a real turn in Herdr, using `herdr pane read --source detection`.
+#
+# Reasonix owns the alternate screen. It pins a composer box (top and bottom rule
+# only, no side borders) plus two status rows to the bottom of the screen. While a
+# turn runs it adds exactly one line directly above the box:
+#
+#   `  <Dot spinner> <label> (<n>s · Esc cancels) [· ↓<tokens>]`
+#
+# The label is localized (`thinking…` / `思考中…` / `思考中…`), so the only
+# language-independent working marker is the spinner glyph. Reasonix animates
+# bubbletea's `spinner.Dot` (⣾⣽⣻⢿⡿⣟⣯⣷) on that line; the transcript tool rows it
+# commits use `spinner.MiniDot` (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) instead, so the two glyph sets are
+# disjoint and a committed tool row cannot be read as a running turn.
+#
+# While a tool approval or a question card is pinned the composer is hidden, so the
+# spinner line sits directly above that panel instead. The same status rows stay
+# visible, which is why idle state cannot be keyed on the `ready` status text: the
+# mode row keeps reporting the idle wording while a turn is in flight. The presence
+# or absence of the spinner line is the discriminator.
+#
+# Approval panels (tool and plan) are the only place Reasonix renders the `⏸` notice
+# glyph. Question cards are the only screen whose mode row shows the `↑/↓` + `←/→`
+# pair at once; the slash/mention completion popup and the resume picker use `↑/↓`
+# alone, and both are user-opened overlays that must not read as blockers.
+
+[[rules]]
+id = "approval_blocked"
+state = "blocked"
+priority = 970
+region = "bottom_non_empty_lines(24)"
+visible_blocker = true
+line_regex = ['^\s*⏸\s+\S']
+any = [
+  # Tool approval: `Choose [1/2/3/4] (y/a/p/n also work)`, translated to
+  # `选择 [1/2/3/4]（兼容 y/a/p/n）` / `選擇 [1/2/3/4]（相容 y/a/p/n）`.
+  # The bracket list and the y/a/p/n aliases survive translation unchanged.
+  { contains = ["[1/2/3/4]", "y/a/p/n"] },
+  # Plan approval: banner prompt and mode row both carry `Enter/y` + `n/Esc`.
+  { contains = ["enter/y", "n/esc"] },
+]
+
+[[rules]]
+id = "question_blocked"
+state = "blocked"
+priority = 960
+region = "bottom_non_empty_lines(24)"
+visible_blocker = true
+contains = ["↑/↓", "←/→"]
+
+[[rules]]
+id = "working_spinner"
+state = "working"
+priority = 900
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+line_regex = ['^\s*[⣾⣽⣻⢿⡿⣟⣯⣷]\s+\S']
+
+[[rules]]
+id = "idle_composer"
+state = "idle"
+priority = 700
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = ['^─{10,}$']
+not = [
+  { line_regex = ['^\s*[⣾⣽⣻⢿⡿⣟⣯⣷]\s+\S'] },
+]
