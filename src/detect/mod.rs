@@ -330,6 +330,58 @@ pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> b
     agent.is_some_and(|agent| manifest::should_skip_state_update(agent, screen_content))
 }
 
+/// Only a rule above this priority is identity evidence. Rule priority marks how
+/// strong the evidence is, and every rule in the bundled catalog sets it, so a
+/// zero or negative priority marks a catch-all that matches any screen (for
+/// example cline's `default_cline_working` or letta's `no_live_state_evidence`).
+/// Those must not fabricate an identity.
+const SCREEN_IDENTITY_MIN_PRIORITY: i32 = 0;
+
+/// Derive an agent identity from the screen alone.
+///
+/// This is the last-resort identity channel for panes whose foreground process
+/// cannot be identified at all, for example a Windows executable started inside a
+/// Windows shell in a WSL pane: the process lives only in the Windows process
+/// table, so `/proc` only ever shows the interop host shell.
+///
+/// The screen is weaker evidence than a process, so the strongest matching rule
+/// wins and an equally strong tie returns `None`. Unmatched screens also return
+/// `None`, which keeps the caller on the existing unknown path.
+pub fn identify_agent_from_screen(screen_content: &str) -> Option<Agent> {
+    if screen_content.trim().is_empty() {
+        return None;
+    }
+    let candidates = Agent::SCREEN_MANIFEST_AGENTS
+        .into_iter()
+        .filter_map(|agent| {
+            let priority = manifest::screen_match_priority(agent, screen_content)?;
+            (priority > SCREEN_IDENTITY_MIN_PRIORITY).then_some((agent, priority))
+        })
+        .collect::<Vec<_>>();
+    strongest_screen_identity(&candidates)
+}
+
+/// Pick the strongest evidence, treating equal strength as ambiguous.
+fn strongest_screen_identity(candidates: &[(Agent, i32)]) -> Option<Agent> {
+    let mut best: Option<(Agent, i32)> = None;
+    let mut tied = false;
+    for &(agent, priority) in candidates {
+        match best {
+            Some((_, best_priority)) if priority < best_priority => {}
+            Some((_, best_priority)) if priority == best_priority => tied = true,
+            _ => {
+                best = Some((agent, priority));
+                tied = false;
+            }
+        }
+    }
+    if tied {
+        None
+    } else {
+        best.map(|(agent, _)| agent)
+    }
+}
+
 pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> bool {
     matches!(
         (source, agent_label),
@@ -2053,5 +2105,98 @@ Enter to select · Esc to cancel"#;
         let tpgid: i32 = fields[5].parse().expect("tpgid should be a number");
         // In CI/test environments without a terminal, tpgid is typically -1
         let _ = tpgid;
+    }
+
+    // Screen evidence captured from a live reasonix bottom buffer. See
+    // `manifest::tests::reasonix_manifest_detects_idle_working_and_blocked_states`.
+    const REASONIX_IDLE_SCREEN: &str = "\
+◆ reasonix  · deepseek-v4-flash
+  Context is kept across turns. Type 'exit' or Ctrl-D to quit.
+
+  › say hello
+
+──────────────────────────────────────────────────
+
+──────────────────────────────────────────────────
+   Auto  · ready (shift+tab toggles plan · ctrl+y yolo) · effort max
+  deepseek-v4-flash · turn hit 99.94% · avg 99.51% · 354.8K ctx (35%) · 45% to compact";
+
+    const REASONIX_WORKING_SCREEN: &str = "\
+  ● Write(probe.txt)  +1
+   1 + ok
+
+  ⣾  thinking… (3s · Esc cancels) · ↓99
+──────────────────────────────────────────────────
+
+──────────────────────────────────────────────────
+   Auto  · ready (shift+tab toggles plan · ctrl+y yolo) · effort max
+  deepseek-v4-flash · turn hit 98.62% · avg 50.13% · 11.9K ctx (1%) · 79% to compact";
+
+    #[test]
+    fn strongest_screen_identity_prefers_stronger_evidence() {
+        assert_eq!(strongest_screen_identity(&[]), None);
+        assert_eq!(
+            strongest_screen_identity(&[(Agent::Reasonix, 700)]),
+            Some(Agent::Reasonix)
+        );
+        assert_eq!(
+            strongest_screen_identity(&[(Agent::Letta, 150), (Agent::Reasonix, 700)]),
+            Some(Agent::Reasonix)
+        );
+        assert_eq!(
+            strongest_screen_identity(&[(Agent::Reasonix, 700), (Agent::Letta, 150)]),
+            Some(Agent::Reasonix)
+        );
+        assert_eq!(
+            strongest_screen_identity(&[(Agent::Letta, 150), (Agent::Claude, 150)]),
+            None,
+            "equally strong evidence is ambiguous"
+        );
+        assert_eq!(
+            strongest_screen_identity(&[(Agent::Cline, -10), (Agent::Claude, 150)]),
+            Some(Agent::Claude)
+        );
+    }
+
+    #[test]
+    fn empty_screens_have_no_screen_identity() {
+        assert_eq!(identify_agent_from_screen(""), None);
+        assert_eq!(identify_agent_from_screen("   \n\t"), None);
+    }
+
+    #[test]
+    fn unrelated_screens_have_no_screen_identity() {
+        assert_eq!(
+            identify_agent_from_screen("~$ ls -la total 8\n"),
+            None,
+            "a catch-all rule must not become an identity"
+        );
+    }
+
+    #[test]
+    fn reasonix_screen_identifies_reasonix() {
+        // Other manifests match this screen too, at weaker priorities: cline's
+        // negative-priority catch-all and letta's composer rule.
+        assert_eq!(
+            manifest::screen_match_priority(Agent::Reasonix, REASONIX_IDLE_SCREEN),
+            Some(700)
+        );
+        assert_eq!(
+            identify_agent_from_screen(REASONIX_IDLE_SCREEN),
+            Some(Agent::Reasonix)
+        );
+    }
+
+    #[test]
+    fn reasonix_identity_survives_a_running_turn() {
+        // The working screen swaps reasonix's rule, but not its identity.
+        assert_eq!(
+            manifest::screen_match_priority(Agent::Reasonix, REASONIX_WORKING_SCREEN),
+            Some(900)
+        );
+        assert_eq!(
+            identify_agent_from_screen(REASONIX_WORKING_SCREEN),
+            Some(Agent::Reasonix)
+        );
     }
 }

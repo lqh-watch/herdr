@@ -295,6 +295,34 @@ pub(super) fn detection_update_for_publish(
     detection_update_for_publish_with_osc(agent, content, "", "", process_exited)
 }
 
+/// Identity for a pane whose foreground process cannot be identified because it is
+/// only a Windows shell reached through WSL interop.
+///
+/// Such a shell's children live in the Windows process table and never appear in
+/// `/proc`, so the pane's screen is the only evidence that reaches this side. Screen
+/// content is weaker evidence than a process, so callers consult this last, and an
+/// ambiguous screen still leaves the pane unidentified.
+pub(super) fn screen_identity_fallback(
+    interop_windows_shell: bool,
+    screen_content: &str,
+) -> Option<Agent> {
+    if !interop_windows_shell || !screen_identity_enabled() {
+        return None;
+    }
+    crate::detect::identify_agent_from_screen(screen_content)
+}
+
+/// Kill switch for screen-derived identity (`HERDR_SCREEN_IDENTITY=0`).
+pub(super) fn screen_identity_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("HERDR_SCREEN_IDENTITY").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
 pub(super) fn detection_update_for_publish_with_osc(
     agent: Option<Agent>,
     content: &str,
@@ -552,5 +580,32 @@ mod tests {
         mark_detection_content_changed(&seq);
 
         assert_eq!(seq.load(Ordering::Relaxed), 1);
+    }
+
+    /// Reasonix's idle composer rule is the only bundled rule that matches a lone
+    /// rule line, so this is unambiguous identity evidence.
+    const REASONIX_IDLE_SCREEN: &str = "\n\n\n\n\n────────────────────────────────\n";
+
+    #[test]
+    fn screen_identity_fallback_needs_an_interop_windows_shell() {
+        // A pane whose foreground process is identifiable must never take its
+        // identity from the screen, however clearly the screen points at an agent.
+        assert_eq!(screen_identity_fallback(false, REASONIX_IDLE_SCREEN), None);
+    }
+
+    #[test]
+    fn screen_identity_fallback_takes_an_unambiguous_screen() {
+        assert_eq!(
+            screen_identity_fallback(true, REASONIX_IDLE_SCREEN),
+            Some(Agent::Reasonix)
+        );
+    }
+
+    #[test]
+    fn screen_identity_fallback_leaves_ambiguous_screens_unidentified() {
+        // Cline's catch-all rule matches every non-empty screen, but a catch-all is
+        // not identity evidence, so this stays unidentified rather than guessing.
+        assert_eq!(screen_identity_fallback(true, "~$ ls -la total 8\n"), None);
+        assert_eq!(screen_identity_fallback(true, ""), None);
     }
 }

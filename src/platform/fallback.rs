@@ -197,6 +197,11 @@ pub fn foreground_job(_child_pid: u32) -> Option<ForegroundJob> {
     None
 }
 
+/// WSL interop only exists on Linux.
+pub(crate) fn foreground_job_is_wsl_interop_windows_shell(_job: &ForegroundJob) -> bool {
+    false
+}
+
 /// Unsupported platform stub.
 pub fn foreground_group_leader_job(_process_group_id: u32) -> Option<ForegroundJob> {
     None

@@ -362,6 +362,35 @@ fn foreground_job_for_group(child_pid: u32, process_group_id: u32) -> Option<For
     )
 }
 
+/// Whether `job` is a Windows shell running through WSL's interop layer.
+///
+/// A Windows executable started from such a shell lives only in the Windows
+/// process table, so `/proc` shows the interop host process instead. The pane
+/// cannot be identified from its process group, and callers may fall back to
+/// screen-derived identity.
+pub(crate) fn foreground_job_is_wsl_interop_windows_shell(job: &ForegroundJob) -> bool {
+    is_interop_windows_shell_job(job, running_inside_wsl())
+}
+
+fn is_interop_windows_shell_job(job: &ForegroundJob, running_inside_wsl: bool) -> bool {
+    if !running_inside_wsl {
+        return false;
+    }
+    let Some(leader) = job
+        .processes
+        .iter()
+        .find(|process| process.pid == job.process_group_id)
+    else {
+        return false;
+    };
+    // `normalized_process_name` lowercases but only strips a lowercase `.exe`,
+    // so accept both spellings.
+    matches!(
+        super::normalized_process_name(&leader.name).as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
+    )
+}
+
 fn foreground_job_from_members(
     process_group_id: u32,
     members: Vec<ProcGroupMember>,
@@ -1172,6 +1201,43 @@ mod tests {
         assert!(text_indicates_wsl("4.4.0-19041-Microsoft"));
         assert!(!text_indicates_wsl("6.8.0-64-generic"));
         assert!(!text_indicates_wsl(""));
+    }
+
+    fn interop_job(leader_name: &str) -> ForegroundJob {
+        ForegroundJob {
+            process_group_id: 100,
+            processes: vec![ForegroundProcess {
+                pid: 100,
+                name: leader_name.to_string(),
+                argv0: None,
+                argv: None,
+                cmdline: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn interop_windows_shell_detection_requires_wsl_and_a_windows_shell_leader() {
+        assert!(is_interop_windows_shell_job(
+            &interop_job("powershell.exe"),
+            true
+        ));
+        assert!(is_interop_windows_shell_job(&interop_job("pwsh.exe"), true));
+        assert!(is_interop_windows_shell_job(&interop_job("cmd.exe"), true));
+        assert!(is_interop_windows_shell_job(
+            &interop_job("PowerShell.EXE"),
+            true
+        ));
+
+        assert!(
+            !is_interop_windows_shell_job(&interop_job("bash"), true),
+            "a native WSL shell keeps the process-identity path"
+        );
+        assert!(
+            !is_interop_windows_shell_job(&interop_job("powershell.exe"), false),
+            "interop only exists inside WSL"
+        );
+        assert!(!is_interop_windows_shell_job(&interop_job("cmd"), false));
     }
 
     #[test]

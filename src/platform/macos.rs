@@ -417,6 +417,11 @@ pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
     super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
 }
 
+/// WSL interop only exists on Linux.
+pub(crate) fn foreground_job_is_wsl_interop_windows_shell(_job: &ForegroundJob) -> bool {
+    false
+}
+
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     if child_pid == 0 {

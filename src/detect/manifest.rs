@@ -434,6 +434,28 @@ pub fn should_skip_state_update(agent: Agent, screen_content: &str) -> bool {
     .skip_state_update
 }
 
+/// Priority of the strongest rule in `agent`'s manifest that genuinely matches
+/// `screen_content`, or `None` when no rule matches.
+///
+/// Used to derive an identity from the screen alone (for panes whose foreground
+/// process cannot be identified), so it must be cheap: callers compare it across
+/// manifests and it reads the precompiled cache, never the remote update status.
+pub(crate) fn screen_match_priority(agent: Agent, screen_content: &str) -> Option<i32> {
+    let loaded = load_manifest(agent)?;
+    evaluate_loaded_manifest(
+        agent,
+        DetectionInput {
+            screen: screen_content,
+            osc_title: "",
+            osc_progress: "",
+        },
+        loaded,
+        false,
+    )
+    .matched_rule
+    .map(|rule| rule.priority)
+}
+
 impl DetectionExplain {
     fn into_detection(self) -> AgentDetection {
         AgentDetection {

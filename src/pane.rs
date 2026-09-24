@@ -36,9 +36,9 @@ mod xtgettcap;
 use self::agent_detection::{
     decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
-    observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    observe_detection_content_change, screen_identity_fallback, DetectionPublishDecision,
+    DetectionScreenReadDecision, DetectionScreenReadInput, PendingIdleConfirmation,
+    ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 #[cfg(unix)]
 pub use self::terminal::InputState;
@@ -579,6 +579,9 @@ struct ProcessProbeResult {
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
     process_name: Option<String>,
+    /// The foreground job is a Windows shell reached through WSL interop, so an
+    /// agent running inside it cannot be seen in `/proc`.
+    interop_windows_shell: bool,
 }
 
 fn agent_hint_for_foreground_job_members(
@@ -619,12 +622,33 @@ fn process_probe_result(
     agent: Agent,
     process_name: String,
 ) -> ProcessProbeResult {
+    let interop_windows_shell = crate::platform::foreground_job_is_wsl_interop_windows_shell(job);
     ProcessProbeResult {
         process_group_id: Some(job.process_group_id),
-        foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
+        // An interop Windows shell is the process the user is actually working in,
+        // so losing it is reported as a process exit instead of waiting for misses.
+        foreground_is_pane_shell: interop_windows_shell
+            || job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
         process_name: Some(process_name),
+        interop_windows_shell,
     }
+}
+
+/// Identity of a foreground job whose processes were not otherwise identified.
+///
+/// A Windows shell reached through WSL interop hides its children from `/proc`, so
+/// the screen is the only remaining evidence for the agent running inside it.
+/// Process evidence, whenever there is any, always wins.
+fn unidentified_job_agent(
+    job: &crate::platform::ForegroundJob,
+    interop_windows_shell: bool,
+    screen_content: &str,
+) -> Option<(Agent, String)> {
+    crate::detect::identify_agent_in_job(job).or_else(|| {
+        screen_identity_fallback(interop_windows_shell, screen_content)
+            .map(|agent| (agent, crate::detect::agent_label(agent).to_string()))
+    })
 }
 
 fn hinted_process_probe_result(
@@ -644,6 +668,7 @@ fn hinted_process_probe_result(
 fn probe_foreground_process_from_jobs(
     pid: u32,
     foreground_pgid: Option<u32>,
+    screen_content: &str,
     leader_job: Option<crate::platform::ForegroundJob>,
     foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
     read_hint: impl Fn(u32) -> Option<Agent> + Copy,
@@ -679,12 +704,16 @@ fn probe_foreground_process_from_jobs(
             );
         }
 
-        let identified = crate::detect::identify_agent_in_job(job);
+        let interop_windows_shell =
+            crate::platform::foreground_job_is_wsl_interop_windows_shell(job);
+        let identified = unidentified_job_agent(job, interop_windows_shell, screen_content);
         return ProcessProbeResult {
             process_group_id: Some(job.process_group_id),
-            foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
+            foreground_is_pane_shell: interop_windows_shell
+                || job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
             process_name: identified.map(|(_, process_name)| process_name),
+            interop_windows_shell,
         };
     }
 
@@ -693,13 +722,19 @@ fn probe_foreground_process_from_jobs(
         foreground_is_pane_shell: false,
         agent: None,
         process_name: None,
+        interop_windows_shell: false,
     }
 }
 
-fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
+fn probe_foreground_process(
+    pid: u32,
+    foreground_pgid: Option<u32>,
+    screen_content: &str,
+) -> ProcessProbeResult {
     probe_foreground_process_from_jobs(
         pid,
         foreground_pgid,
+        screen_content,
         foreground_pgid.and_then(crate::detect::foreground_group_leader_job),
         || crate::detect::foreground_job(pid),
         crate::platform::process_agent_hint,
@@ -743,6 +778,9 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
+        // Set from the last probe: the foreground job is a Windows shell reached
+        // through WSL interop, so its agent can only be seen on the screen.
+        let mut interop_windows_shell = false;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -771,6 +809,7 @@ fn spawn_basic_detection_task(
                     last_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
+                    interop_windows_shell = false;
                 }
             }
 
@@ -805,17 +844,23 @@ fn spawn_basic_detection_task(
                     pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
                 };
+                // An interop Windows shell keeps its process group for its whole
+                // lifetime, so the probe has to keep reading the screen that stands
+                // in for the process it hides.
+                let should_probe =
+                    interop_windows_shell || should_probe_foreground_job(process_probe_input);
                 !should_skip_process_probe_for_lifecycle_authority(
                     lifecycle_authority_active,
                     process_probe_input,
-                ) && should_probe_foreground_job(process_probe_input)
+                ) && should_probe
             };
 
             if should_check_process {
                 last_process_check = now;
                 let had_process_probe = has_process_probe;
                 has_process_probe = true;
-                let probe = probe_foreground_process(pid, foreground_pgid);
+                let probe = probe_foreground_process(pid, foreground_pgid, &last_detection_text);
+                interop_windows_shell = probe.interop_windows_shell;
                 let process_group_id = probe.process_group_id;
                 let tracked_process_group_id =
                     process_group_for_change_tracking(foreground_pgid, process_group_id);
@@ -866,7 +911,11 @@ fn spawn_basic_detection_task(
                         // the evidence its own process already emitted.
                         clear_osc_evidence_for_agent_transition(&terminal, previous_agent);
                         if let Some(agent) = agent {
-                            agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
+                            // The grace window keeps a freshly spawned process from
+                            // being read before it draws. An interop Windows shell's
+                            // agent is on screen already, so it needs no grace.
+                            agent_startup_grace_until =
+                                (!interop_windows_shell).then(|| now + AGENT_STARTUP_GRACE_WINDOW);
                             state = AgentState::Unknown;
                             last_visible_idle = false;
                             last_visible_blocker = false;
@@ -2623,6 +2672,10 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
+                // Set from the last probe: the foreground job is a Windows shell
+                // reached through WSL interop, so its agent can only be seen on the
+                // screen.
+                let mut interop_windows_shell = false;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2661,6 +2714,7 @@ impl PaneRuntime {
                             last_screen_scan_detection_content_seq = None;
                             agent_startup_grace_until = None;
                             pending_idle.clear();
+                            interop_windows_shell = false;
                         }
                     }
 
@@ -2721,10 +2775,15 @@ impl PaneRuntime {
                             foreground_pgid,
                             ..process_probe_input
                         };
+                        // An interop Windows shell keeps its process group for its
+                        // whole lifetime, so the probe has to keep reading the screen
+                        // that stands in for the process it hides.
+                        let should_probe = interop_windows_shell
+                            || should_probe_foreground_job(process_probe_input);
                         !should_skip_process_probe_for_lifecycle_authority(
                             lifecycle_authority_active,
                             process_probe_input,
-                        ) && should_probe_foreground_job(process_probe_input)
+                        ) && should_probe
                     };
 
                     let mut agent_changed = false;
@@ -2733,7 +2792,12 @@ impl PaneRuntime {
                         let had_process_probe = has_process_probe;
                         has_process_probe = true;
                         if pid > 0 {
-                            let probe = probe_foreground_process(pid, foreground_pgid);
+                            let probe = probe_foreground_process(
+                                pid,
+                                foreground_pgid,
+                                &last_detection_text,
+                            );
+                            interop_windows_shell = probe.interop_windows_shell;
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;
                             let tracked_process_group_id = process_group_for_change_tracking(
@@ -2796,8 +2860,12 @@ impl PaneRuntime {
                                         previous_agent,
                                     );
                                     if let Some(agent) = agent {
-                                        agent_startup_grace_until =
-                                            Some(now + AGENT_STARTUP_GRACE_WINDOW);
+                                        // The grace window keeps a freshly spawned
+                                        // process from being read before it draws. An
+                                        // interop Windows shell's agent is on screen
+                                        // already, so it needs no grace.
+                                        agent_startup_grace_until = (!interop_windows_shell)
+                                            .then(|| now + AGENT_STARTUP_GRACE_WINDOW);
                                         state = AgentState::Unknown;
                                         last_visible_idle = false;
                                         last_visible_blocker = false;
@@ -4874,6 +4942,7 @@ mod tests {
         let result = probe_foreground_process_from_jobs(
             42,
             Some(99),
+            "",
             Some(job),
             || None,
             |pid| (pid == 99).then_some(Agent::Claude),
@@ -4881,6 +4950,42 @@ mod tests {
 
         assert_eq!(result.agent, Some(Agent::Claude));
         assert_eq!(result.process_name.as_deref(), Some("claude"));
+    }
+
+    /// Reasonix's idle composer rule is the only bundled rule that matches a lone
+    /// rule line, so this is unambiguous screen identity evidence.
+    const REASONIX_SCREEN: &str = "\n\n\n\n\n────────────────────────────────\n";
+
+    #[test]
+    fn interop_windows_shell_takes_its_identity_from_the_screen() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "powershell.exe")],
+        };
+
+        assert_eq!(
+            unidentified_job_agent(&job, true, REASONIX_SCREEN),
+            Some((Agent::Reasonix, "reasonix".to_string())),
+            "an interop Windows shell hides its agent from /proc, so the screen names it"
+        );
+        assert_eq!(
+            unidentified_job_agent(&job, false, REASONIX_SCREEN),
+            None,
+            "a pane whose process is not an interop Windows shell must not use the screen"
+        );
+    }
+
+    #[test]
+    fn process_identity_always_wins_over_the_screen() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "codex")],
+        };
+
+        assert_eq!(
+            unidentified_job_agent(&job, true, REASONIX_SCREEN),
+            Some((Agent::Codex, "codex".to_string()))
+        );
     }
 
     #[test]
@@ -4893,6 +4998,7 @@ mod tests {
         let result = probe_foreground_process_from_jobs(
             42,
             Some(99),
+            "",
             None,
             || Some(job),
             |pid| (pid == 99).then_some(Agent::Claude),
@@ -4915,6 +5021,7 @@ mod tests {
         let result = probe_foreground_process_from_jobs(
             42,
             Some(99),
+            "",
             None,
             || Some(job),
             |pid| (pid == 100).then_some(Agent::Claude),
@@ -4937,6 +5044,7 @@ mod tests {
         let result = probe_foreground_process_from_jobs(
             42,
             Some(99),
+            "",
             None,
             || Some(job),
             |pid| (pid == 100).then_some(Agent::Claude),

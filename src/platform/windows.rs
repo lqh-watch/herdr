@@ -1386,6 +1386,11 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     select_pane_foreground_job_cached(child_pid)
 }
 
+/// WSL interop only exists on Linux; native Windows enumerates real processes.
+pub(crate) fn foreground_job_is_wsl_interop_windows_shell(_job: &ForegroundJob) -> bool {
+    false
+}
+
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
     let snapshot = ProcessSnapshot::new(snapshot_processes());
     available_pane_shell_from_snapshot(child_pid, &snapshot)
